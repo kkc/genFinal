@@ -747,9 +747,11 @@ sim_main(void)
 	       sim_num_insn, &regs, mem);
 
   generate_fragment_translation_time(mem);
-  struct scratchpad_t *st = scratchpad_create(3072,0);
+  L2_cache *l2_cache = L2_cache_create(8092);
+  struct scratchpad_t *st = scratchpad_create(3072,0,l2_cache);
   unsigned long int scratchpad_lat = 0;
   unsigned long int lat = 0;
+  struct fragment_t *query_ft = NULL;
 
   while (TRUE)
   {
@@ -768,7 +770,14 @@ sim_main(void)
 				  NULL, ISCOMPRESS(sizeof(md_inst_t)), 0, NULL, NULL);
       MD_FETCH_INST(inst, mem, regs.regs_PC);
 
-      lat = scratchpad_access(st,IACOMPRESS(regs.regs_PC));
+      addr = IACOMPRESS(regs.regs_PC);
+      query_ft = query_fragment(addr);
+
+      if ( query_ft->in_L2 )
+          lat = L2_cache_access(st->L2_cache_ptr, addr);
+      else  //in L1 or need to be translated
+          lat = scratchpad_access(st, query_ft);
+
       if (lat != 0)
       {
           scratchpad_lat += lat;

@@ -31,6 +31,8 @@ void set_fragment_table(int index,                //table index
    fragment_table[index].start_address = start_address;
    fragment_table[index].end_address   = end_address;
    fragment_table[index].size          = size;
+   fragment_table[index].in_L2         = 0;
+   fragment_table[index].L2_access_count = 0;
    fragment_table[index].in_scratchpad = 0;
    fragment_table[index].in_type       = 0;
    fragment_table[index].next_ptr      = NULL;
@@ -40,6 +42,9 @@ void set_fragment_table(int index,                //table index
    fragment_table[index].penalty       = 0;
 }
 
+/**
+ * 得到這個instruction需要translation的cycle count
+ **/ 
 int get_trans_time(md_inst_t inst)
 {
     int count;

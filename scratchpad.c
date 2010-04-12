@@ -11,7 +11,8 @@ extern FILE *fp_result;
 
 struct scratchpad_t *
 scratchpad_create(int lo_scratchpad_size,
-                  int hi_scratchpad_size)
+                  int hi_scratchpad_size,
+                  L2_cache *L2_cache_ptr)
 {
     struct scratchpad_t *st = 
         (struct scratchpad_t *) malloc (1 * sizeof(struct scratchpad_t));
@@ -32,6 +33,9 @@ scratchpad_create(int lo_scratchpad_size,
 
     st->hi_count = 0;
     st->lo_count = st->max_lo_size;
+
+    st->L2_cache_ptr = L2_cache_ptr;
+    return st;
 }
 
 segment *segment_create()
@@ -195,7 +199,29 @@ void segment_hi_append(struct scratchpad_t *st, segment *seg, struct fragment_t 
     //fprintf(fp_result,"\nappend address:%d, size: %d\n",ft->start_address, ft->size);
 }
 
-void segment_append(struct scratchpad_t *st, segment *seg, struct fragment_t *ft)
+/**
+ * check position and segment boundry
+ **/ 
+int segment_overflow(segment *seg)
+{
+    return seg->append_pos >= SEGMENT_SIZE;
+}
+
+/**
+ * fixed scratchpad memory low tail pointer
+ * */
+void fixed_st_tail_ptr(struct scratchpad_t *st, segment *seg)
+{
+    segment *next_seg = get_next_segment(st,seg,0);
+    next_seg->append_pos = seg->append_pos - SEGMENT_SIZE;
+    seg->append_pos = SEGMENT_SIZE;
+    st->lo_tail_ptr = next_seg;
+}
+
+/**
+ * append fragment to segment
+ **/ 
+void segment_append(segment *seg, struct fragment_t *ft)
 {
     // empty
     if (seg->ft_list == NULL && seg->ft_tail == NULL)
@@ -207,17 +233,9 @@ void segment_append(struct scratchpad_t *st, segment *seg, struct fragment_t *ft
         seg->ft_tail = ft;
     }
 
-    // check position and segment boundry
+    // correct fragment position
     ft->pos = seg->append_pos;
     seg->append_pos += ft->size;
-
-    if (seg->append_pos >= SEGMENT_SIZE)
-    {
-        segment *next_seg = get_next_segment(st,seg,0);
-        next_seg->append_pos = seg->append_pos - SEGMENT_SIZE;
-        seg->append_pos = SEGMENT_SIZE;
-        st->lo_tail_ptr = next_seg;
-    }
 
     //update fragment status
     ft->in_scratchpad = 1;
@@ -228,17 +246,9 @@ void segment_append(struct scratchpad_t *st, segment *seg, struct fragment_t *ft
 }
 
 unsigned long int 
-scratchpad_access(struct scratchpad_t *st, md_addr_t addr)
+scratchpad_access(struct scratchpad_t *st, struct fragment_t *ft)
 {
-   if (st->lo_count + st->hi_count != st->max_lo_size)
-   {
-       printf("error");
-       exit(1);
-   }
-
-   //fprintf(fp_result,"access addr:%d ",addr);
    unsigned long int lat = 0;  //latency
-   struct fragment_t *ft = query_fragment(addr); 
 
    if ( ft->in_scratchpad )
    {
@@ -249,25 +259,13 @@ scratchpad_access(struct scratchpad_t *st, md_addr_t addr)
             st->short_counter = 1;
         else
             st->short_counter++;
-
-        //fprintf(fp_result,"in low\n");
      }
      else if (ft->in_type == 1)
      {
         ft->hi_hit++;
         st->hi_dirty = 1;
         st->higher_counter++;
-        //fprintf(fp_result,"in high\n");
      }
-
-     /*
-     if (st->short_counter == 25)
-     {
-        if ( !scratchpad_hi_empty(st) )
-            scratchpad_lo_enlarge(st);
-        st->short_counter = 0;
-     }*/
-
      return lat;
    }
 
@@ -442,6 +440,10 @@ scratchpad_hi_append(struct scratchpad_t *st,
     segment_hi_append(st, seg, ft);
 }
 
+/**
+ * 檢查remove掉的fragments,看看是否有可以提升到high part的fragment
+ * @param st 傳入scratchpad物件
+ */ 
 void check_removed_list(struct scratchpad_t *st)
 {
     int i;
@@ -466,7 +468,9 @@ scratchpad_append(struct scratchpad_t *st,
    if( scratchpad_lo_empty(st) )   //scratchpad is empty?
    {
        segment *seg = st->lo_head_ptr;
-       segment_append(st,seg,ft);
+       segment_append(seg,ft);
+       if ( segment_overflow(seg) )
+           fixed_st_tail_ptr(st,seg);
        return;
    }
 
@@ -481,7 +485,9 @@ scratchpad_append(struct scratchpad_t *st,
    }
 
    segment *seg = st->lo_tail_ptr;
-   segment_append(st,seg,ft);
+   segment_append(seg,ft);
+   if ( segment_overflow(seg) )
+       fixed_st_tail_ptr(st,seg);
    check_removed_list(st);
 }
 
@@ -638,4 +644,246 @@ int scratchpad_probe(md_addr_t addr)
         return 0;
     else
         return 1;
+}
+
+/**
+ * initialize L2 cache
+ * @param L2 cache size
+ **/ 
+L2_cache *L2_cache_create(int max_size)
+{
+    L2_cache *L2_cache_ptr = malloc (sizeof(L2_cache));
+    L2_cache_ptr->segment_list = segment_list_create(max_size/SEGMENT_SIZE);
+    L2_cache_ptr->head_ptr = L2_cache_ptr->tail_ptr = L2_cache_ptr->segment_list;
+    L2_cache_ptr->buffer_start_pos = 0;
+    return L2_cache_ptr;
+}
+
+/**
+ *  the best way to construct a bit mask in C with m set bits preceded by k unset bits, and  
+ *  followed by n unset bits
+ *  00..0 11..1 00..0
+ *    k     m     n    ===>  01111000
+ **/ 
+md_addr_t buffer_mask(int m,int n)
+{
+    return ~(~0 << m) << n;
+}
+
+/**
+ *   to get buffer position
+ *    xxxx101xx
+ *   &000011100
+ *   ----------
+ *    000010100 
+ *    we shift right this value twice -> we get 101
+ * */
+int get_buffer_pos(md_addr_t addr)
+{
+    return ((addr & buffer_mask(3,2)) >> 2);
+}
+
+int in_the_buffer(L2_cache *l2c, md_addr_t addr)
+{
+    if ( l2c->buffer_start_pos < get_buffer_pos(addr) &&
+         get_buffer_pos(addr) < 8)
+        return 1;
+    
+    return 0;
+}
+
+/**
+ * prefetching to fill row buffer
+ **/ 
+void prefetch(L2_cache *l2c, md_addr_t addr)
+{
+    md_addr_t start_address;
+    int burst_count = 0;
+
+    l2c->buffer_start_pos = get_buffer_pos(addr);
+}
+
+/**
+ * access translated instruction in the L2 cache 
+ * @param the pointer to the L2_cache 
+ * @param the pointer to the address
+ * */
+unsigned long int L2_cache_access(L2_cache *l2c, md_addr_t addr)
+{
+    unsigned long int latency = 0;
+
+    if ( in_the_buffer(l2c,addr) )
+        latency = 4;
+    else
+    {
+        latency = 10;
+        prefetch(l2c,addr);
+    }
+    return latency;
+}
+
+/**
+ * is L2 cache empty?
+ * */
+int L2_cache_empty(L2_cache *l2c)
+{
+    if (l2c->head_ptr == l2c->tail_ptr &&
+        l2c->head_ptr->ft_list == NULL)
+        return 1;
+    
+    return 0;
+}
+
+/***
+ * get next segment in L2 cache
+ **/ 
+segment *get_L2_next_segment(L2_cache *l2c, segment *seg)
+{
+    segment *next_seg;
+    if (seg->next_ptr != NULL)
+        next_seg = seg->next_ptr;
+    else
+        next_seg = l2c->segment_list;
+
+    return next_seg;
+}
+
+/**
+ * fixed L2 cache tail pointer
+ * */
+void fixed_L2_cache_tail_ptr(L2_cache *l2c, segment *seg)
+{
+    segment *next_seg = get_L2_next_segment(l2c, seg);
+    next_seg->append_pos = seg->append_pos - SEGMENT_SIZE;
+    seg->append_pos = SEGMENT_SIZE;
+    l2c->tail_ptr = next_seg;
+}
+
+/**
+ * remove last fragment in the segment
+ */
+void remove_segment_last_element(segment *prev_seg)
+{
+    // handle segment's fragment list
+    if (prev_seg->ft_list == prev_seg->ft_tail)
+        prev_seg->ft_list = prev_seg->ft_tail = NULL;
+    else
+    {
+        struct fragment_t *iter = prev_seg->ft_list;
+        while(iter->next_ptr != prev_seg->ft_tail)
+           iter = iter->next_ptr;
+
+        iter->next_ptr = NULL;
+        prev_seg->ft_tail = iter;
+    }
+}
+
+void
+remove_L2_fragment(struct fragment_t *removed_ft)
+{
+    removed_ft->in_scratchpad = 0;
+    removed_ft->replace++;
+    removed_ft->next_ptr = NULL;
+    removed_ft->in_type = 0;
+}
+
+segment *get_L2_prev_segment(L2_cache *l2c, segment *seg)
+{
+    if(seg->prev_ptr != NULL)
+        return seg->prev_ptr;
+    else
+    {
+        segment *iter = seg;
+        while(iter->next_ptr != NULL)
+            iter = iter->next_ptr;
+        return iter;
+    }
+}
+
+int last_L2_segment_fragment_cross(l2c, seg) 
+{
+    segment *prev_seg = get_L2_prev_segment(l2c, seg);
+    if (prev_seg == seg)
+        return 0;
+    else if (prev_seg->ft_tail != NULL &&
+             prev_seg->ft_tail->pos + prev_seg->ft_tail->size > SEGMENT_SIZE)
+        return 1;
+    else
+        return 0;
+}
+
+/**
+ * remove fragment from L2 cache 
+ * @param the pointer to the L2_cache 
+ * @param the pointer to the segment
+ **/ 
+void L2_segment_flush(L2_cache *l2c, segment *seg)
+{
+    if (seg->ft_list == NULL && seg->append_pos == 0)
+        return;
+
+    if (last_L2_segment_fragment_cross(l2c, seg) )
+    {
+        segment *prev_seg = get_L2_prev_segment(l2c, seg);
+        struct fragment_t *removed_ft = prev_seg->ft_tail;
+        prev_seg->append_pos = removed_ft->pos;
+        remove_L2_fragment(removed_ft);
+        remove_segment_last_element(prev_seg);
+    }
+
+    struct fragment_t *removed_ft;
+    while(seg->ft_list != NULL)
+    {
+        removed_ft = seg->ft_list;
+        seg->ft_list = seg->ft_list->next_ptr;
+        remove_L2_fragment(removed_ft);
+    }
+    seg->ft_tail = NULL;
+
+    seg->append_pos = 0;
+    segment *next_seg = get_L2_next_segment(l2c, seg);
+    if ( next_seg != l2c->segment_list)
+        next_seg->append_pos = 0;
+}
+
+int L2_cache_full(L2_cache *l2c, struct fragment_t *ft)
+{
+    if (l2c->tail_ptr != l2c->head_ptr &&
+        l2c->tail_ptr->append_pos + ft->size >= SEGMENT_SIZE)
+    {
+        segment *next_seg = get_L2_next_segment(l2c, l2c->tail_ptr);
+        if(next_seg == l2c->head_ptr)
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * remove fragment from L1, and append to L2 cache 
+ * @param the pointer to the L2_cache 
+ * @param the pointer to the fragment
+ **/ 
+void L2_cache_append(L2_cache *l2c, struct fragment_t *ft)
+{
+    if ( L2_cache_empty(l2c) )
+    {
+        segment *seg = l2c->head_ptr;
+        segment_append(seg,ft);
+        if ( segment_overflow(seg) )
+            fixed_L2_cache_tail_ptr(l2c,seg);
+        return;
+    }
+
+    if ( L2_cache_full(l2c, ft) )
+    {
+        segment *seg = l2c->head_ptr;
+        L2_segment_flush(l2c,seg);
+        segment *next_seg = get_L2_next_segment(l2c, seg);
+        l2c->head_ptr = next_seg;
+    }
+
+    struct segment_t *seg = l2c->tail_ptr;
+    segment_append(seg, ft);
+    if ( segment_overflow(seg) )
+        fixed_L2_cache_tail_ptr(l2c, seg);
 }

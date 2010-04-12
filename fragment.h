@@ -13,6 +13,8 @@ struct fragment_t
     md_addr_t end_address;          /*fragment end address*/ 
     md_addr_t size;                 /*fragment size*/
     int penalty;                    /*translation time*/
+    int in_L2;                      /*check if this fragment is in the L2 cache(memory)*/
+    int L2_access_count;            /*the count this fragment is accessed in the L2 cache*/
     int in_scratchpad;              /*check if this fragment is in scratchpad */
     int in_type;                    /*0:in low, 1:in high*/
     int lo_hit;                     /*hit in low scratchpad*/
